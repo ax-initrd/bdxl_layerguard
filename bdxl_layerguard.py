@@ -7,42 +7,32 @@ multi-layer Blu-ray (BDXL / BD-R DL / BD-R XL) disc.
 A 100 GB BDXL is three 32,794,804,224-byte recording layers stacked on one
 side.  The drive has to refocus at each layer change, and the couple of
 hundred megabytes around those two crossover points are the least reliable
-part of the disc.  This tool builds a staging tree whose *byte layout on the
-finished disc* is known in advance, so that the only things sitting on the
-transitions are zero-filled buffer files nobody cares about.
+part of the disc.  This tool writes a disc image whose *byte layout* it
+controls exactly, so that the only things sitting on the transitions are
+zero-filled buffer files nobody cares about.
 
-Three subcommands:
+Two subcommands:
 
-  build-udf   RECOMMENDED. Write a ready-to-burn UDF 1.02 image directly.
-              This tool lays out every extent itself, so the buffers land on
-              the transitions byte-exactly - no estimating, no second pass.
-              The source tree is preserved unchanged (restore is a plain
-              recursive copy), files of any size work (UDF has no 4 GiB
-              limit), and a file that would land on a transition is split at
-              the extent level so it steps over the buffer while still being
-              one file to the reader. Needs no external tools.
-
-  plan        The older ISO 9660 route: build a staging tree of segments,
-              pad files and buffers, to be handed to xorriso. Kept because
-              plain ISO 9660 + Rock Ridge is maximally boring to read, but
-              it wastes space on alignment padding, splits the tree across
-              segment directories, cannot represent a file over 4 GiB
-              without multi-extent records that macOS and Windows mishandle,
-              and its offsets depend on estimating the filesystem metadata.
+  build-udf   Write a ready-to-burn UDF 1.02 image.  The tool lays out every
+              extent itself, so the buffers land on the transitions
+              byte-exactly - nothing is estimated.  The source tree is
+              preserved unchanged (restore is a plain recursive copy), files
+              of any size work (UDF stores lengths in 64 bits, so there is no
+              4 GiB limit), and a file that would land on a transition is
+              split at the extent level so it steps over the buffer while
+              still being one file to the reader.
 
   verify      Read the finished image (or the burned disc) and report which
               file each layer transition actually falls inside, with the
-              margin on each side. Understands UDF and ISO 9660; --raw skips
-              the filesystem entirely and just checks the bytes are zero,
-              which works on any filesystem and on Windows raw devices.
+              margin on each side.  --raw skips the filesystem entirely and
+              just checks the bytes are zero, which works on any filesystem
+              and on Windows raw devices.
 
-Standard library only.  Python 3.8+.  Linux, macOS, Windows.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import stat
@@ -51,14 +41,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 SECTOR = 2048
-
-# An ISO 9660 directory record carries a 32-bit data length, so one extent
-# holds at most 4 GiB - 1, rounded down to a whole sector.  Bigger files become
-# several records chained with the "not final extent" flag (ISO level 3).
-ISO_EXTENT_MAX = 0xFFFFF800          # 4,294,965,248
 
 # (layers, bytes per layer).  Layer sizes are the standard Blu-ray figures:
 # 25,025,314,816 B per layer for BD-R/BD-RE, 32,794,804,224 B per layer for
@@ -70,10 +55,6 @@ DISC_PRESETS: Dict[str, Tuple[int, int]] = {
     "bd-128": (4, 32_794_804_224),
 }
 DEFAULT_DISC = "bd-100"
-
-BUFFER_PREFIX = "BUFF_T"
-PAD_PREFIX = "PAD_T"
-MANIFEST_NAME = "MANIFEST.TXT"
 
 
 class LayoutError(Exception):
@@ -149,17 +130,6 @@ class Scan:
     unreadable: List[str] = field(default_factory=list)
     hardlink_groups: int = 0       # files sharing an inode with another file
     largest: int = 0
-    # accumulated filesystem-metadata cost (see estimate_metadata)
-    meta_iso: int = 0
-    meta_joliet: int = 0
-    ptable_iso: int = 0
-    ptable_joliet: int = 0
-
-
-def _rec_len(name_len: int) -> int:
-    """ISO 9660 directory record length: 33 B header + name, padded to even."""
-    n = 33 + name_len
-    return n + (n & 1)
 
 
 def scan_source(root: Path, follow_symlinks: bool = False) -> Scan:
@@ -182,18 +152,6 @@ def scan_source(root: Path, follow_symlinks: bool = False) -> Scan:
                     kept.append(name)
             dirnames[:] = kept
 
-        # "." and ".." records open every directory extent
-        iso_dir = 2 * _rec_len(1)
-        jol_dir = 2 * _rec_len(1)
-
-        for name in dirnames:
-            iso_dir += _rec_len(min(len(name), 31)) + 90   # 90 ~ Rock Ridge
-            jol_dir += _rec_len(2 * min(len(name), 64))
-        # path table entries for this directory itself
-        nm = len(d.name) if d != root else 1
-        sc.ptable_iso += 8 + min(nm, 31) + (min(nm, 31) & 1)
-        sc.ptable_joliet += 8 + 2 * min(nm, 64)
-
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = (d / name).relative_to(root).as_posix()
@@ -215,70 +173,14 @@ def scan_source(root: Path, follow_symlinks: bool = False) -> Scan:
             sc.total_bytes += st.st_size
             sc.padded_bytes += align_up(st.st_size)
             sc.largest = max(sc.largest, st.st_size)
-            # files carry a ";1" version suffix in the ISO namespace, and a
-            # file over 4 GiB is split into one record per 4 GiB extent
-            extents = max(1, -(-st.st_size // ISO_EXTENT_MAX))
-            iso_dir += extents * (_rec_len(min(len(name), 31) + 2) + 90)
-            jol_dir += extents * _rec_len(2 * min(len(name), 64))
-
-        sc.meta_iso += align_up(iso_dir)
-        sc.meta_joliet += align_up(jol_dir)
 
     sc.hardlink_groups = sum(1 for v in inodes.values() if v > 1)
     return sc
 
 
 # ---------------------------------------------------------------------------
-# filesystem metadata estimate
+# disc geometry
 # ---------------------------------------------------------------------------
-
-def estimate_metadata(sc: Scan, joliet: bool = True, udf: bool = False,
-                      safety: float = 0.10) -> int:
-    """Estimate the bytes the writer puts in front of the first file extent.
-
-    mkisofs-family writers emit, in this order: a 32 KiB system area, the
-    volume descriptors, the path tables, the complete directory hierarchy
-    (once per namespace), and only then file contents.  Directory extents are
-    sector aligned, which is why this is computed per directory rather than
-    per entry - a directory with six small entries still costs a whole sector
-    in each namespace, and on a tree of git objects that term dominates
-    everything else.
-
-    The estimate is a first-pass guess.  `verify` reports the real figure from
-    the built image; feed it back as --metadata-reserve for an exact layout.
-    """
-    entries = len(sc.files) + sc.n_dirs
-
-    fixed = 16 * SECTOR          # system area
-    fixed += 8 * SECTOR          # PVD, Joliet SVD, terminator, version block
-
-    total = fixed + sc.meta_iso + 2 * align_up(sc.ptable_iso)
-    if joliet:
-        total += sc.meta_joliet + 2 * align_up(sc.ptable_joliet)
-
-    if udf:
-        # UDF allocates a file entry block per file/dir, plus its own anchors,
-        # and xorriso does not necessarily place them all before the data.
-        total += entries * SECTOR + 2 * 1024 * 1024
-
-    return align_up(int(total * (1.0 + safety)))
-
-
-# ---------------------------------------------------------------------------
-# the layout
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Item:
-    """One top-level entry of the staging tree, in on-disc order."""
-    kind: str              # "segment" | "pad" | "buffer" | "manifest"
-    name: str              # top-level name in the staging tree
-    start: int             # planned byte offset on the disc
-    size: int              # payload bytes
-    padded: int            # bytes actually consumed (sector aligned)
-    entries: List[Entry] = field(default_factory=list)
-    transition: Optional[int] = None   # byte offset of the transition it guards
-
 
 @dataclass
 class Geometry:
@@ -294,471 +196,27 @@ class Geometry:
         return [self.layer_bytes * k for k in range(1, self.layers)]
 
 
-def build_layout(sc: Scan, geo: Geometry, buffer_size: int, metadata_reserve: int,
-                 bias: float = 0.5, manifest_reserve: int = 0) -> Tuple[List[Item], dict]:
-    n_trans = len(geo.transitions)
-    buffer_padded = align_up(buffer_size)
-
-    required = metadata_reserve + sc.padded_bytes + n_trans * buffer_padded + manifest_reserve
-    if required > geo.capacity:
-        raise LayoutError(
-            "does not fit on the disc.\n"
-            "  backup data (sector aligned) : %s\n"
-            "  %d x buffer                  : %s\n"
-            "  filesystem metadata (est.)   : %s\n"
-            "  manifest reserve             : %s\n"
-            "  ------------------------------ \n"
-            "  required                     : %s\n"
-            "  disc capacity                : %s\n"
-            "  short by                     : %s\n"
-            "Reduce --buffer, drop data, or split the backup over two discs."
-            % (both(sc.padded_bytes), n_trans, both(n_trans * buffer_padded),
-               both(metadata_reserve), both(manifest_reserve),
-               both(required), both(geo.capacity), both(required - geo.capacity))
-        )
-
-    placed = [False] * len(sc.files)
-    items: List[Item] = []
-    cursor = metadata_reserve
-    seq = 1
-
-    def fill(limit: int, cur: int) -> Tuple[List[Entry], int]:
-        """Greedily take files, in source order, that still fit below limit."""
-        chosen: List[Entry] = []
-        for i, e in enumerate(sc.files):
-            if placed[i]:
-                continue
-            need = align_up(e.size)
-            if cur + need <= limit:
-                placed[i] = True
-                chosen.append(e)
-                cur += need
-        return chosen, cur
-
-    unguarded: List[int] = []
-
-    def add_segment(layer: int, start: int, end: int, entries: List[Entry]) -> None:
-        nonlocal seq
-        # skip empty middle segments, but always keep the first one: the
-        # source's empty directories are recreated there
-        if not entries and items:
-            return
-        items.append(Item(kind="segment", name="%02d_DATA_L%d" % (seq, layer),
-                          start=start, size=end - start, padded=end - start,
-                          entries=entries))
-        seq += 1
-
-    for idx, T in enumerate(geo.transitions, start=1):
-        buf_start = align_down(T - int(buffer_size * bias))
-        if not (buf_start < T < buf_start + buffer_padded):
-            raise LayoutError(
-                "with --bias %.2f the buffer would not actually cover the "
-                "transition at %s. Use a bias between 0.05 and 0.95."
-                % (bias, both(T)))
-        if buf_start < cursor:
-            raise LayoutError(
-                "buffer #%d would have to start at %s, which is before the "
-                "current write position %s - the data placed so far already "
-                "runs past it. Use a smaller --buffer."
-                % (idx, both(buf_start), both(cursor)))
-
-        seg_entries, new_cursor = fill(buf_start, cursor)
-        add_segment(idx, cursor, new_cursor, seg_entries)
-        cursor = new_cursor
-
-        # If the backup is already fully placed and ends well short of this
-        # transition, the transition sits in blank space: no buffer needed, and
-        # certainly no multi-gigabyte pad to reach it.  "Well short" means more
-        # than one buffer width of slack, so that metadata drift cannot creep
-        # the last file into the transition zone.
-        if all(placed) and cursor + buffer_size < buf_start:
-            unguarded.extend(geo.transitions[idx - 1:])
-            break
-
-        pad = buf_start - cursor
-        if pad > 0:
-            items.append(Item(kind="pad", name="%02d_%s%d.BIN" % (seq, PAD_PREFIX, idx),
-                              start=cursor, size=pad, padded=pad, transition=T))
-            seq += 1
-            cursor += pad
-
-        items.append(Item(kind="buffer", name="%02d_%s%d.BIN" % (seq, BUFFER_PREFIX, idx),
-                          start=cursor, size=buffer_size, padded=buffer_padded,
-                          transition=T))
-        seq += 1
-        cursor += buffer_padded
-    else:
-        # tail segment, everything after the last transition
-        tail_entries, new_cursor = fill(geo.capacity - manifest_reserve, cursor)
-        add_segment(geo.layers, cursor, new_cursor, tail_entries)
-        cursor = new_cursor
-
-    leftover = [e for i, e in enumerate(sc.files) if not placed[i]]
-    if leftover:
-        biggest = max(leftover, key=lambda e: e.size)
-        raise LayoutError(
-            "could not place %d file(s), %s in total.\n"
-            "Largest unplaced: %s (%s).\n"
-            "This happens when a single file is bigger than the space left "
-            "between two transitions, or when the buffers eat the room the "
-            "data needs. Try a smaller --buffer, or split that file."
-            % (len(leftover), both(sum(align_up(e.size) for e in leftover)),
-               biggest.rel, both(biggest.size))
-        )
-
-    if manifest_reserve:
-        items.append(Item(kind="manifest", name="%02d_%s" % (seq, MANIFEST_NAME),
-                          start=cursor, size=0, padded=manifest_reserve))
-
-    stats = {
-        "data_padded": sc.padded_bytes,
-        "buffers": sum(i.padded for i in items if i.kind == "buffer"),
-        "pads": sum(i.padded for i in items if i.kind == "pad"),
-        "metadata_reserve": metadata_reserve,
-        "manifest_reserve": manifest_reserve,
-        "end_of_data": cursor + manifest_reserve,
-        "free_tail": geo.capacity - (cursor + manifest_reserve),
-        "unguarded_transitions": unguarded,
-    }
-    return items, stats
-
-
-def verify_layout(items: List[Item], geo: Geometry) -> List[str]:
-    """Re-derive the guarantee from the computed layout.  Belt and braces."""
-    problems: List[str] = []
-    cursor = None
-    for it in items:
-        if cursor is not None and it.start != cursor:
-            problems.append("gap/overlap before %s: expected start %d, got %d"
-                            % (it.name, cursor, it.start))
-        cursor = it.start + it.padded
-    if cursor is not None and cursor > geo.capacity:
-        problems.append("layout ends at %d, past capacity %d" % (cursor, geo.capacity))
-
-    end_of_layout = cursor or 0
-    # every transition must be inside a buffer item, or past the end of the
-    # written data (where there is nothing to lose)
-    for T in geo.transitions:
-        owner = None
-        for it in items:
-            if it.start <= T < it.start + it.padded:
-                owner = it
-                break
-        if owner is None:
-            if T < end_of_layout:
-                problems.append("transition at %d is in an unaccounted gap" % T)
-        elif owner.kind != "buffer":
-            problems.append("transition at %d falls in %s (%s), not a buffer"
-                            % (T, owner.name, owner.kind))
-
-    # and no data file may straddle a transition
-    for it in items:
-        if it.kind != "segment":
-            continue
-        off = it.start
-        for e in it.entries:
-            end = off + align_up(e.size)
-            for T in geo.transitions:
-                if off < T < end:
-                    problems.append("data file %s spans transition at %d" % (e.rel, T))
-            off = end
-    return problems
-
-
 # ---------------------------------------------------------------------------
-# materialising the staging tree
-# ---------------------------------------------------------------------------
-
-def make_zero_file(path: Path, size: int, sparse: bool = True) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if sparse:
-        with open(path, "wb") as f:
-            f.truncate(size)
-        if path.stat().st_size == size:
-            return
-    chunk = b"\0" * (4 * 1024 * 1024)
-    with open(path, "wb") as f:
-        left = size
-        while left > 0:
-            n = min(left, len(chunk))
-            f.write(chunk[:n])
-            left -= n
-
-
-def materialise(src: str, dst: Path, mode: str, counters: Dict[str, int]) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    order = {
-        "auto": ("hardlink", "symlink", "copy"),
-        "hardlink": ("hardlink",),
-        "symlink": ("symlink",),
-        "copy": ("copy",),
-    }[mode]
-    last_err: Optional[Exception] = None
-    for how in order:
-        try:
-            if how == "hardlink":
-                os.link(src, dst)
-            elif how == "symlink":
-                os.symlink(os.path.abspath(src), dst)
-            else:
-                import shutil
-                shutil.copy2(src, dst)
-            counters[how] = counters.get(how, 0) + 1
-            return
-        except (OSError, NotImplementedError) as exc:
-            last_err = exc
-            continue
-    raise LayoutError("cannot place %s into the staging tree: %s" % (src, last_err))
-
-
-def write_manifest(path: Path, items: List[Item], sc: Scan, geo: Geometry,
-                   cfg: argparse.Namespace, stats: dict) -> None:
-    lines: List[str] = []
-    w = lines.append
-    w("bdxl_layerguard manifest")
-    w("generated        : %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
-    w("source           : %s" % cfg.source)
-    w("disc             : %s  (%d layers x %s = %s)"
-      % (cfg.disc, geo.layers, both(geo.layer_bytes), both(geo.capacity)))
-    w("layer transitions: %s" % ", ".join(format(t, ",") for t in geo.transitions))
-    w("buffer size      : %s" % both(cfg.buffer_bytes))
-    w("files            : %d in %d directories, %s"
-      % (len(sc.files), sc.n_dirs, both(sc.total_bytes)))
-    w("")
-    w("RESTORE: merge the DATA_L* directories into one tree; they keep the")
-    w("original relative paths. The PAD_* and BUFF_* files are zero filled")
-    w("and can be deleted. e.g. on Linux:")
-    w("    for d in /mnt/disc/*_DATA_L*; do cp -a \"$d/.\" /restore/; done")
-    w("")
-    w("=== planned on-disc layout ===")
-    w("%-22s %16s %16s %16s" % ("entry", "start", "end", "size"))
-    for it in items:
-        w("%-22s %16s %16s %16s"
-          % (it.name, format(it.start, ","), format(it.start + it.padded, ","),
-             format(it.padded, ",")))
-    w("")
-    w("=== planned file offsets (segment order; the writer may reorder")
-    w("    files *within* a segment, which does not move segment bounds) ===")
-    w("%16s %16s  %s" % ("start", "size", "path"))
-    for it in items:
-        if it.kind != "segment":
-            continue
-        off = it.start
-        for e in it.entries:
-            w("%16s %16s  %s/%s" % (format(off, ","), format(e.size, ","), it.name, e.rel))
-            off += align_up(e.size)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def write_plan_files(plan_dir: Path, items: List[Item], sc: Scan, geo: Geometry,
-                     cfg: argparse.Namespace, stats: dict, staging: Path) -> None:
-    plan_dir.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "source": str(cfg.source),
-        "staging": str(staging),
-        "disc": cfg.disc,
-        "layers": geo.layers,
-        "layer_bytes": geo.layer_bytes,
-        "capacity": geo.capacity,
-        "transitions": geo.transitions,
-        "buffer_bytes": cfg.buffer_bytes,
-        "bias": cfg.bias,
-        "metadata_reserve": cfg.metadata_reserve,
-        "stats": stats,
-        "items": [
-            {"kind": it.kind, "name": it.name, "start": it.start, "size": it.size,
-             "padded": it.padded, "transition": it.transition,
-             "file_count": len(it.entries)}
-            for it in items
-        ],
-    }
-    (plan_dir / "layout.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    # Sort-weight files: higher weight = closer to the start of the image.
-    # Only the top level needs pinning, because the total padded size of a
-    # segment does not depend on the order of the files inside it.
-    # xorriso wants "NUMBER PATH", genisoimage wants "PATH NUMBER".
-    step = 1000
-    xo: List[str] = []
-    gi: List[str] = []
-    for i, it in enumerate(items):
-        w = step * (len(items) + 1 - i)
-        xo.append("%d /%s" % (w, it.name))
-        gi.append("%s %d" % ((staging / it.name).as_posix(), w))
-    (plan_dir / "sort_weights_xorriso.txt").write_text("\n".join(xo) + "\n", encoding="utf-8")
-    (plan_dir / "sort_weights_genisoimage.txt").write_text("\n".join(gi) + "\n", encoding="utf-8")
-
-    label = cfg.label or ("BACKUP_" + time.strftime("%Y%m%d"))
-    iso_out = cfg.iso or "backup.iso"
-    # NB: xorriso/libisofs has no UDF writer at all - "-as mkisofs -udf" is
-    # rejected as an unsupported option. Only the metadata estimate knows
-    # about UDF, for when the image is built by a tool that can write it.
-    ns = "-iso-level 3 -r" + ("" if cfg.no_joliet else " -J -joliet-long")
-    cmds = f"""# ---------------------------------------------------------------------------
-# 1) build the image  (xorriso, recommended)
-# ---------------------------------------------------------------------------
-# -iso-level 3 gives multi-extent support for files > 4 GiB, so no -udf is
-# needed; UDF metadata placement is less predictable, so leave it off unless
-# you specifically need it (and then use a bigger buffer).
-xorriso -as mkisofs \\
-  {ns} \\
-  -V "{label}" \\
-  --sort-weight-list "{(plan_dir / 'sort_weights_xorriso.txt').as_posix()}" \\
-  -o "{iso_out}" \\
-  "{staging.as_posix()}"
-
-# same thing with genisoimage instead (note -no-cache-inodes: without it,
-# hardlinked duplicates share one extent and every offset after them shifts)
-# genisoimage {ns} -no-cache-inodes \\
-#   -sort "{(plan_dir / 'sort_weights_genisoimage.txt').as_posix()}" \\
-#   -V "{label}" -o "{iso_out}" "{staging.as_posix()}"
-
-# ---------------------------------------------------------------------------
-# 2) PROVE the layout before burning  <-- do not skip this
-# ---------------------------------------------------------------------------
-python3 "{Path(__file__).name}" verify "{iso_out}" --disc {cfg.disc} \\
-  --buffer {cfg.buffer_bytes}
-
-# ---------------------------------------------------------------------------
-# 3) burn as a single closed session (SAO/DAO). No multisession, no packet
-#    writing - either would move LBA 0 and shift every offset.
-# ---------------------------------------------------------------------------
-xorriso -as cdrecord -v dev=/dev/sr0 -sao -eject "{iso_out}"
-#   or: growisofs -dvd-compat -Z /dev/sr0="{iso_out}"
-#   Windows: burn "{iso_out}" with ImgBurn in "Write image file to disc" mode,
-#            Write Type = SAO/DAO, Verify on.
-#   macOS:   hdiutil burn "{iso_out}"
-
-# ---------------------------------------------------------------------------
-# 4) after burning, verify against the disc itself
-#    Linux/macOS only - on Windows, verify the .iso in step 2 instead, since
-#    Python cannot do raw sector reads of \\\\.\\D: reliably.
-# ---------------------------------------------------------------------------
-python3 "{Path(__file__).name}" verify /dev/sr0 --disc {cfg.disc} --buffer {cfg.buffer_bytes}
-#   macOS: the raw device is /dev/rdisk<N> (see `diskutil list`)
-
-# ---------------------------------------------------------------------------
-# 5) restoring later
-# ---------------------------------------------------------------------------
-# The backup tree is split across the *_DATA_L* directories, each keeping the
-# original relative paths. Merge them and the original tree is back:
-#   for d in /mnt/disc/*_DATA_L*; do cp -a "$d/." /restore/; done
-# The *_PAD_*.BIN and *_BUFF_*.BIN files are zeros and can be ignored.
-"""
-    (plan_dir / "burn_commands.txt").write_text(cmds, encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# ISO 9660 reader, for verify
+# shared by the verifiers
 # ---------------------------------------------------------------------------
 
 @dataclass
-class IsoFile:
+class VolumeFile:
+    """One file as the volume records it, with its real byte extents."""
     path: str
-    lba: int
-    size: int          # sum of all extents
-    padded: int
+    lba: int                                   # first extent, in sectors
+    size: int                                  # total bytes
+    padded: int                                # bytes occupied on the disc
     extents: List[Tuple[int, int]] = field(default_factory=list)
 
 
-# A filler file is one this tool created: a numbered PAD_Tn.BIN / BUFF_Tn.BIN
-# sitting at the root of the image.  Anchoring both the pattern and the depth
-# means a file inside the backup data cannot be mistaken for a buffer.
-_FILLER_RE = re.compile(r"^\d+_(?:%s|%s)\d+\.BIN\.?$"
-                        % (re.escape(BUFFER_PREFIX), re.escape(PAD_PREFIX)))
-
-
-def is_filler(iso_path: str) -> bool:
-    if iso_path.count("/") != 1:          # must be at the volume root
+def is_filler(path: str) -> bool:
+    """True for a buffer file this tool created.  Anchoring both the name
+    pattern and the depth means a file inside the backup data cannot be
+    mistaken for a buffer."""
+    if path.count("/") != 1:              # must be at the volume root
         return False
-    base = iso_path.rsplit("/", 1)[-1]
-    return bool(_FILLER_RE.match(base.upper()) or _BUFFER_NAME_RE.match(base))
-
-
-def _find_pvd(f) -> bytes:
-    for sector in range(16, 64):
-        f.seek(sector * SECTOR)
-        buf = f.read(SECTOR)
-        if len(buf) < 7:
-            break
-        if buf[1:6] == b"CD001":
-            if buf[0] == 1:
-                return buf
-            if buf[0] == 255:
-                break
-    raise LayoutError("no ISO 9660 primary volume descriptor found "
-                      "(is this a single-session ISO 9660 image?)")
-
-
-def _records(data: bytes) -> Iterable[bytes]:
-    i = 0
-    while i < len(data):
-        ln = data[i]
-        if ln == 0:
-            i = (i // SECTOR + 1) * SECTOR
-            continue
-        if i + ln > len(data):
-            break
-        yield data[i:i + ln]
-        i += ln
-
-
-def read_iso(path: str) -> Tuple[List[IsoFile], int, int]:
-    """Return (files, volume_size_bytes, first_data_offset)."""
-    files: List[IsoFile] = []
-    with open(path, "rb") as f:
-        pvd = _find_pvd(f)
-        block = int.from_bytes(pvd[128:130], "little") or SECTOR
-        vol_blocks = int.from_bytes(pvd[80:84], "little")
-        root = pvd[156:190]
-        root_lba = int.from_bytes(root[2:6], "little")
-        root_len = int.from_bytes(root[10:14], "little")
-
-        stack: List[Tuple[str, int, int]] = [("", root_lba, root_len)]
-        seen = set()
-        while stack:
-            prefix, lba, length = stack.pop()
-            if (lba, length) in seen:
-                continue
-            seen.add((lba, length))
-            f.seek(lba * block)
-            data = f.read(length)
-            pending: Optional[IsoFile] = None
-            for rec in _records(data):
-                name_len = rec[32]
-                raw = rec[33:33 + name_len]
-                flags = rec[25]
-                ext_lba = int.from_bytes(rec[2:6], "little")
-                ext_len = int.from_bytes(rec[10:14], "little")
-                if name_len == 1 and raw in (b"\x00", b"\x01"):
-                    continue
-                name = raw.decode("latin-1")
-                if name.endswith(";1"):
-                    name = name[:-2]
-                full = prefix + "/" + name
-                if flags & 0x02:
-                    stack.append((full, ext_lba, ext_len))
-                    continue
-                if pending is not None and pending.path == full:
-                    pending.size += ext_len
-                    pending.padded += align_up(ext_len, block)
-                else:
-                    if pending is not None:
-                        files.append(pending)
-                    pending = IsoFile(path=full, lba=ext_lba, size=ext_len,
-                                      padded=align_up(ext_len, block))
-                if not (flags & 0x80):
-                    files.append(pending)
-                    pending = None
-            if pending is not None:
-                files.append(pending)
-
-    files = [x for x in files if x.size > 0]
-    files.sort(key=lambda x: x.lba)
-    first_data = files[0].lba * SECTOR if files else 0
-    return files, vol_blocks * block, first_data
+    return bool(_BUFFER_NAME_RE.match(path.rsplit("/", 1)[-1]))
 
 
 def zero_run_around(path: str, T: int, window: int, block: int = 1 << 20) -> Tuple[int, int]:
@@ -824,49 +282,35 @@ def cmd_raw_verify(cfg: argparse.Namespace) -> int:
                           if ok else "FAIL - see above"))
     print("\nNote: this check cannot tell a zero-filled buffer from genuinely "
           "zero-filled\nbackup data. It is the right check for UDF images and "
-          "burned discs; for an\nISO 9660 image, the default check names the "
-          "actual file at each transition.")
+          "burned discs; the default\ncheck reads the UDF structures "
+          "instead and names the actual file at each transition.")
     return 0 if ok else 2
 
 
-def detect_filesystem(path: str) -> str:
-    """'udf', 'iso9660', 'hybrid' or 'unknown', from the on-disc structures."""
+def has_udf_anchor(path: str) -> bool:
+    """Is there a valid UDF anchor volume descriptor pointer at sector 256?"""
     with open(path, "rb", buffering=0) as f:
-        f.seek(16 * SECTOR)
-        vrs = f.read(SECTOR)
         f.seek(256 * SECTOR)
         anchor = f.read(SECTOR)
-    has_iso = len(vrs) >= 6 and vrs[1:6] == b"CD001"
-    has_udf = (len(anchor) >= 2
-               and struct.unpack_from("<H", anchor, 0)[0] == 2
-               and (sum(anchor[0:4]) + sum(anchor[5:16])) & 0xFF == anchor[4])
-    if has_iso and has_udf:
-        return "hybrid"
-    return "udf" if has_udf else ("iso9660" if has_iso else "unknown")
+    return (len(anchor) >= 16
+            and struct.unpack_from("<H", anchor, 0)[0] == 2
+            and (sum(anchor[0:4]) + sum(anchor[5:16])) & 0xFF == anchor[4])
 
 
 def cmd_verify(cfg: argparse.Namespace) -> int:
     if cfg.raw:
         return cmd_raw_verify(cfg)
     geo = geometry_from(cfg)
-    kind = cfg.fs if cfg.fs != "auto" else detect_filesystem(cfg.image)
-    if kind == "hybrid":
-        print("NOTE: this image carries BOTH UDF and ISO 9660. If any file "
-              "exceeds 4 GiB\n      the ISO 9660 side may report a truncated "
-              "size, so which filesystem a\n      reader picks changes what it "
-              "restores. Checking the UDF side.\n")
-        kind = "udf"
     try:
-        if kind == "udf":
-            files, vol_size, first_data = read_udf(cfg.image)
-        elif kind == "iso9660":
-            files, vol_size, first_data = read_iso(cfg.image)
-        else:
-            raise LayoutError("no UDF or ISO 9660 structures found in %s" % cfg.image)
+        if not has_udf_anchor(cfg.image):
+            raise LayoutError("no UDF anchor found in %s - if this image was "
+                              "built by another tool, check it with --raw"
+                              % cfg.image)
+        files, vol_size, first_data = read_udf(cfg.image)
     except LayoutError as exc:
         print("%s\nFalling back to the raw zero-run check.\n" % exc)
         return cmd_raw_verify(cfg)
-    print("filesystem       : %s" % kind)
+    print("filesystem       : UDF")
 
     print("image            : %s" % cfg.image)
     print("volume size      : %s" % both(vol_size))
@@ -958,213 +402,6 @@ def geometry_from(cfg: argparse.Namespace) -> Geometry:
     if layers < 1 or layer_bytes < SECTOR:
         raise LayoutError("nonsensical disc geometry")
     return Geometry(layers=layers, layer_bytes=layer_bytes)
-
-
-def cmd_plan(cfg: argparse.Namespace) -> int:
-    source = Path(cfg.source).expanduser()
-    if not source.is_dir():
-        raise LayoutError("source folder does not exist: %s" % source)
-
-    geo = geometry_from(cfg)
-    cfg.buffer_bytes = parse_size(cfg.buffer)
-    if cfg.buffer_bytes <= 0:
-        raise LayoutError("--buffer must be positive")
-    if geo.layers < 2:
-        raise LayoutError("%s has one recording layer, so there are no layer "
-                          "transitions to protect."
-                          % ("the requested geometry" if cfg.layers else cfg.disc))
-    if cfg.buffer_bytes >= geo.layer_bytes:
-        raise LayoutError("--buffer (%s) must be smaller than one layer (%s)"
-                          % (both(cfg.buffer_bytes), both(geo.layer_bytes)))
-    if not 0.05 <= cfg.bias <= 0.95:
-        raise LayoutError("--bias must be between 0.05 and 0.95 (0.5 centres "
-                          "the buffer on the transition)")
-
-    print("scanning %s ..." % source)
-    sc = scan_source(source, follow_symlinks=cfg.follow_symlinks)
-    if not sc.files:
-        raise LayoutError("no regular files found under %s" % source)
-
-    if cfg.metadata_reserve and str(cfg.metadata_reserve).startswith("@"):
-        probe = str(cfg.metadata_reserve)[1:]
-        _, _, first_data = read_iso(probe)
-        meta = align_up(first_data)
-        meta_note = "measured from %s" % probe
-    elif cfg.metadata_reserve:
-        meta = align_up(parse_size(cfg.metadata_reserve))
-        meta_note = "given"
-    else:
-        meta = estimate_metadata(sc, joliet=not cfg.no_joliet, udf=cfg.udf)
-        meta_note = "estimated"
-
-    # the manifest is written last, in the tail, so an over-estimate here only
-    # costs unused tail space and cannot move any transition
-    manifest_reserve = 0 if cfg.no_manifest else align_up(8192 + 220 * (len(sc.files) + 64))
-
-    items, stats = build_layout(sc, geo, cfg.buffer_bytes, meta,
-                                bias=cfg.bias, manifest_reserve=manifest_reserve)
-    problems = verify_layout(items, geo)
-    if problems:
-        raise LayoutError("internal layout check failed:\n  " + "\n  ".join(problems))
-
-    # ---- report -----------------------------------------------------------
-    print()
-    print("source        : %s" % source)
-    print("               %d files in %d dirs, %s (%s sector aligned)"
-          % (len(sc.files), sc.n_dirs, both(sc.total_bytes), human(sc.padded_bytes)))
-    if sc.largest:
-        print("               largest file %s" % both(sc.largest))
-    print("disc          : %s - %d layers x %s, capacity %s"
-          % (cfg.disc, geo.layers, both(geo.layer_bytes), both(geo.capacity)))
-    print("transitions   : %s" % ", ".join(both(t) for t in geo.transitions))
-    print("buffer        : %s each, %.0f%% of it before the transition"
-          % (both(cfg.buffer_bytes), cfg.bias * 100))
-    print("metadata      : %s (%s)" % (both(meta), meta_note))
-    print()
-    print("%-22s %17s %17s %14s  %s" % ("entry", "start", "end", "size", "contents"))
-    for it in items:
-        if it.kind == "segment":
-            desc = "%d files" % len(it.entries)
-        elif it.kind == "buffer":
-            desc = "zeros - guards transition at %s" % format(it.transition, ",")
-        elif it.kind == "pad":
-            desc = "zeros - alignment"
-        else:
-            desc = "layout manifest"
-        print("%-22s %17s %17s %14s  %s"
-              % (it.name, format(it.start, ","), format(it.start + it.padded, ","),
-                 human(it.padded), desc))
-    print()
-    print("space         : data %s | buffers %s | alignment pads %s | "
-          "metadata %s | unused tail %s"
-          % (human(stats["data_padded"]), human(stats["buffers"]),
-             human(stats["pads"]), human(meta), human(stats["free_tail"])))
-
-    end_of_data = stats["end_of_data"]
-    for T in geo.transitions:
-        owner = next((i for i in items if i.start <= T < i.start + i.padded), None)
-        if owner is None:
-            print("check         : transition %s is %s past the end of the written "
-                  "data - nothing there to lose, no buffer needed"
-                  % (format(T, ","), human(T - end_of_data)))
-        else:
-            print("check         : transition %s is inside %s  (%s before / %s after)"
-                  % (format(T, ","), owner.name, human(T - owner.start),
-                     human(owner.start + owner.padded - T)))
-
-    warn = []
-    if sc.skipped_symlinks:
-        warn.append("%d symlink(s) skipped (use --follow-symlinks to include "
-                    "their targets)" % len(sc.skipped_symlinks))
-    if sc.skipped_special:
-        warn.append("%d non-regular file(s) skipped" % len(sc.skipped_special))
-    if sc.unreadable:
-        warn.append("%d path(s) could not be stat'ed" % len(sc.unreadable))
-    if sc.hardlink_groups:
-        warn.append("%d hardlinked file group(s) in the source: pass "
-                    "-no-cache-inodes to genisoimage (xorriso is fine) or the "
-                    "offsets will shift" % sc.hardlink_groups)
-    if cfg.buffer_bytes < 64 * 1024 * 1024:
-        warn.append("buffer is smaller than 64 MiB; metadata estimation drift "
-                    "could eat it. 256 MiB - 1 GiB is a sane range for a 100 GB disc")
-    if stats["pads"] > geo.capacity // 100:
-        warn.append("%s went into alignment padding. That happens when a large "
-                    "file cannot fit in the space left before a transition; "
-                    "splitting the biggest files would recover most of it"
-                    % human(stats["pads"]))
-    if stats["unguarded_transitions"]:
-        warn.append("%d transition(s) need no buffer: the backup ends before "
-                    "them" % len(stats["unguarded_transitions"]))
-    for m in warn:
-        print("warning       : %s" % m)
-
-    huge = [e for e in sc.files if e.size > ISO_EXTENT_MAX]
-    if huge:
-        print()
-        print("*** %d file(s) are larger than the ISO 9660 extent limit of %s."
-              % (len(huge), human(ISO_EXTENT_MAX)))
-        print("    Largest: %s (%s)"
-              % (max(huge, key=lambda e: e.size).rel,
-                 human(max(e.size for e in huge))))
-        print("    They will be stored as multi-extent files: one directory")
-        print("    record per %s chunk, all pointing at one contiguous run of"
-              % human(ISO_EXTENT_MAX))
-        print("    bytes. The layout in this plan is unaffected - the chunks are")
-        print("    contiguous and the total is the same - but READING them back")
-        print("    is another matter:")
-        print("      Linux + xorriso  : fine, one whole file")
-        print("      macOS            : shows one entry per chunk, same name;")
-        print("                         you cannot copy the file back correctly")
-        print("      Windows CDFS     : may refuse the file outright")
-        print("    Fix it one of two ways before you burn:")
-        print("      1. split the big files below %s and plan again" % human(ISO_EXTENT_MAX))
-        print("         (split -b 3900M big.mkv big.mkv.part_  /  cat parts > big.mkv)")
-        print("      2. build a UDF image instead - UDF has no 4 GiB limit.")
-        print("         xorriso cannot write UDF at all, so use one of:")
-        print("           macOS  : hdiutil makehybrid -udf -udf-volume-name V \\")
-        print("                      -o out.iso <staging>")
-        print("           Windows: ImgBurn Build mode, File System = UDF 2.50+,")
-        print("                      with 'sort files by source list order'")
-        print("           Linux  : genisoimage -udf ...")
-        print("         then check it with:  verify <iso> --raw --buffer %s"
-              % cfg.buffer)
-        print("         (--raw reads the bytes instead of the ISO 9660 metadata,")
-        print("          which is the only way to check a UDF image here)")
-
-    if cfg.dry_run:
-        print("\n(dry run - nothing written)")
-        return 0
-
-    # ---- materialise ------------------------------------------------------
-    staging = Path(cfg.out).expanduser().resolve()
-    if staging.exists() and any(staging.iterdir()):
-        raise LayoutError("staging folder %s exists and is not empty" % staging)
-    plan_dir = Path(str(staging) + "_plan")
-    staging.mkdir(parents=True, exist_ok=True)
-
-    print("\nbuilding staging tree in %s" % staging)
-    counters: Dict[str, int] = {}
-    done = 0
-    for it in items:
-        if it.kind == "segment":
-            base = staging / it.name
-            base.mkdir(parents=True, exist_ok=True)
-            for e in it.entries:
-                materialise(e.src, base / Path(e.rel), cfg.link_mode, counters)
-                done += 1
-                if done % 2000 == 0:
-                    print("  %d/%d files ..." % (done, len(sc.files)))
-        elif it.kind in ("pad", "buffer"):
-            make_zero_file(staging / it.name, it.size, sparse=not cfg.no_sparse)
-        # manifest written below
-
-    # empty dirs go into the first segment so the tree round-trips
-    first_seg = next(i for i in items if i.kind == "segment")
-    for d in sc.empty_dirs:
-        (staging / first_seg.name / Path(d)).mkdir(parents=True, exist_ok=True)
-
-    manifest_item = next((i for i in items if i.kind == "manifest"), None)
-    if manifest_item is not None:
-        write_manifest(staging / manifest_item.name, items, sc, geo, cfg, stats)
-
-    write_plan_files(plan_dir, items, sc, geo, cfg, stats, staging)
-    if manifest_item is not None:
-        import shutil
-        shutil.copy2(staging / manifest_item.name, plan_dir / MANIFEST_NAME)
-
-    print("  placed %d files (%s)"
-          % (done, ", ".join("%s=%d" % kv for kv in sorted(counters.items()))))
-    print("\nwrote:")
-    print("  %s   <- feed this to xorriso" % staging)
-    print("  %s/layout.json" % plan_dir)
-    print("  %s/sort_weights_xorriso.txt (+ genisoimage variant)" % plan_dir)
-    print("  %s/burn_commands.txt   <- copy/paste from here" % plan_dir)
-    print("\nNext: build the ISO with the command in burn_commands.txt, then run")
-    print("  %s verify <iso> --disc %s --buffer %s"
-          % (Path(sys.argv[0]).name, cfg.disc, cfg.buffer))
-    print("before you burn. Verify reads the real directory records, so it is")
-    print("the step that actually proves the buffers landed on the transitions.")
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1834,7 +1071,7 @@ def write_udf_image(out: Path, root: UNode, dirs: List[UNode], files: List[UNode
 # UDF reader, for verify
 # ---------------------------------------------------------------------------
 
-def read_udf(path: str) -> Tuple[List[IsoFile], int, int]:
+def read_udf(path: str) -> Tuple[List[VolumeFile], int, int]:
     """Walk a UDF volume and return every file's real byte extents."""
     with open(path, "rb", buffering=0) as f:
         def sector(n: int) -> bytes:
@@ -1874,7 +1111,7 @@ def read_udf(path: str) -> Tuple[List[IsoFile], int, int]:
         fsd = sector(part_start + fsd_block)
         root_block = struct.unpack_from("<I", fsd, 400 + 4)[0]
 
-        out: List[IsoFile] = []
+        out: List[VolumeFile] = []
 
         def read_fe(block: int) -> Tuple[int, int, List[Tuple[int, int]], int]:
             blob = sector(part_start + block)
@@ -1935,7 +1172,7 @@ def read_udf(path: str) -> Tuple[List[IsoFile], int, int]:
                 else:
                     ctype, clen, cads, _ = read_fe(child)
                     if clen > 0 and cads:
-                        out.append(IsoFile(path=full, lba=cads[0][0] // SECTOR,
+                        out.append(VolumeFile(path=full, lba=cads[0][0] // SECTOR,
                                            size=clen,
                                            padded=sum(align_up(l) for _, l in cads)))
                         out[-1].extents = cads              # type: ignore[attr-defined]
@@ -1959,9 +1196,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="examples:\n"
                "  %(prog)s build-udf ~/Pictures --buffer 512M -o backup.iso\n"
                "  %(prog)s verify backup.iso --buffer 512M\n"
-               "  %(prog)s verify /dev/sr0 --raw --buffer 512M\n"
-               "\nburn the image with ImgBurn in 'Write image file to disc'\n"
-               "mode (never Build mode), SAO/DAO, single closed session.\n",
+               "  %(prog)s verify /dev/sr0 --raw --buffer 512M\n",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1972,49 +1207,9 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("--layers", type=int, help="override the layer count")
         q.add_argument("--layer-bytes", help="override the bytes per layer")
 
-    a = sub.add_parser("plan", help="scan a folder and build the staging tree")
-    a.add_argument("source", help="folder containing the data to back up")
-    a.add_argument("--buffer", required=True,
-                   help="size of EACH zero-filled buffer file, e.g. 512M or 1G")
-    a.add_argument("-o", "--out", default="./bdxl_staging",
-                   help="staging folder to create (default %(default)s)")
-    geo_args(a)
-    a.add_argument("--bias", type=float, default=0.5,
-                   help="fraction of the buffer placed before the transition "
-                        "(default 0.5 = centred)")
-    a.add_argument("--metadata-reserve", metavar="SIZE|@ISO",
-                   help="bytes of filesystem metadata to assume in front of the "
-                        "file data. Omit to estimate. Pass @some.iso to measure "
-                        "it from a previously built image, which makes the "
-                        "second pass exact")
-    a.add_argument("--udf", action="store_true",
-                   help="you will build the image with a UDF-capable tool "
-                        "(NOT xorriso - it has no UDF writer). Enlarges the "
-                        "metadata estimate accordingly; UDF placement is less "
-                        "predictable, so use a bigger buffer and verify --raw")
-    a.add_argument("--no-joliet", action="store_true",
-                   help="you will build without -J (Windows-friendly names); "
-                        "roughly halves the metadata estimate")
-    a.add_argument("--link-mode", choices=("auto", "hardlink", "symlink", "copy"),
-                   default="auto",
-                   help="how to put source files in the staging tree "
-                        "(default auto: hardlink, else symlink, else copy)")
-    a.add_argument("--follow-symlinks", action="store_true",
-                   help="follow symlinks in the source instead of skipping them")
-    a.add_argument("--no-sparse", action="store_true",
-                   help="write real zeros for the buffers instead of sparse files")
-    a.add_argument("--no-manifest", action="store_true",
-                   help="do not put a manifest on the disc")
-    a.add_argument("--label", help="volume label for the generated burn command")
-    a.add_argument("--iso", help="ISO filename for the generated burn command")
-    a.add_argument("--dry-run", action="store_true",
-                   help="print the layout and stop, write nothing")
-    a.set_defaults(func=cmd_plan)
-
     c = sub.add_parser("build-udf",
-                       help="write a ready-to-burn UDF image directly "
-                            "(recommended: exact offsets, no 4 GiB limit, "
-                            "tree preserved)")
+                       help="write a ready-to-burn UDF image: exact offsets, "
+                            "no 4 GiB limit, source tree preserved")
     c.add_argument("source", help="folder containing the data to back up")
     c.add_argument("--buffer", required=True,
                    help="size of EACH zero-filled buffer file, e.g. 512M or 1G")
@@ -2036,7 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="print the layout and stop, write nothing")
     c.set_defaults(func=cmd_build_udf)
 
-    b = sub.add_parser("verify", help="check a built ISO or a burned disc")
+    b = sub.add_parser("verify", help="check a built image or a burned disc")
     b.add_argument("image", help="path to the .iso, or a device such as /dev/sr0")
     geo_args(b)
     b.add_argument("--buffer", help="expected buffer size, for margin warnings")
@@ -2044,11 +1239,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the filesystem and just read the bytes around "
                         "each transition, checking they are all zero. Use this "
                         "for UDF images, hybrid images, and burned discs on "
-                        "Windows (all reads are sector aligned)")
+                        "Windows")
     b.add_argument("--window", help="how far either side of a transition --raw "
                                     "scans (default: --buffer, else 256M)")
-    b.add_argument("--fs", choices=("auto", "udf", "iso9660"), default="auto",
-                   help="which filesystem to read (default: detect)")
     b.set_defaults(func=cmd_verify)
     return p
 
